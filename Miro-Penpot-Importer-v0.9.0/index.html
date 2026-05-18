@@ -1,0 +1,381 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Miro SVG Importer</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      background: #1f1f1f;
+      color: #f2f2f2;
+      margin: 0;
+      padding: 16px;
+    }
+
+    h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+
+    p {
+      line-height: 1.4;
+      color: #cfcfcf;
+    }
+
+    input, button {
+      margin-top: 12px;
+      font-size: 14px;
+    }
+
+    button {
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    #log {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      font-size: 12px;
+      color: #9be7ff;
+      background: #111;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 220px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h2>Local Miro SVG Importer</h2>
+
+  <p>
+    Choose a local SVG file. This stays on your machine and is sent only into your local Penpot plugin runtime.
+  </p>
+
+  <input id="file" type="file" accept=".svg,image/svg+xml" />
+  <br />
+  <button id="import">Import SVG Images + Vector Overlay + Text</button>
+
+  <div id="log">Waiting for SVG...</div>
+
+  <script>
+    const fileInput = document.getElementById("file");
+    const log = document.getElementById("log");
+
+    function getHref(element) {
+      return (
+        element.getAttribute("href") ||
+        element.getAttribute("xlink:href") ||
+        ""
+      );
+    }
+
+    function getTransformChain(element) {
+      const chain = [];
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const t = current.getAttribute("transform");
+        if (t) chain.unshift(t);
+        current = current.parentNode;
+      }
+
+      return chain.join(" ");
+    }
+
+    function parseStyle(styleValue) {
+      const out = {};
+      if (!styleValue) return out;
+
+      const parts = styleValue.split(";");
+
+      for (const part of parts) {
+        const idx = part.indexOf(":");
+        if (idx === -1) continue;
+
+        const key = part.slice(0, idx).trim();
+        const value = part.slice(idx + 1).trim();
+
+        if (key) out[key] = value;
+      }
+
+      return out;
+    }
+
+    function parseCssRules(doc) {
+      const classRules = {};
+      const styleNodes = Array.from(doc.querySelectorAll("style"));
+
+      for (const styleNode of styleNodes) {
+        const css = styleNode.textContent || "";
+        const regex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]+)\}/g;
+        let match;
+
+        while ((match = regex.exec(css)) !== null) {
+          const className = match[1];
+          const body = match[2];
+          classRules[className] = parseStyle(body);
+        }
+      }
+
+      return classRules;
+    }
+
+    function getClassStyleProp(element, classRules, name) {
+      const classAttr = element.getAttribute("class") || "";
+      const classes = classAttr.split(/\s+/).filter(Boolean);
+
+      for (const cls of classes) {
+        const rule = classRules[cls];
+        if (rule && rule[name]) {
+          return rule[name];
+        }
+      }
+
+      return "";
+    }
+
+    function getDirectSvgProp(element, classRules, name, fallback = "") {
+      const direct = element.getAttribute(name);
+      if (direct !== null && direct !== undefined && direct !== "") {
+        return direct;
+      }
+
+      const inlineStyle = parseStyle(element.getAttribute("style") || "");
+      if (inlineStyle[name]) {
+        return inlineStyle[name];
+      }
+
+      const classValue = getClassStyleProp(element, classRules, name);
+      if (classValue) {
+        return classValue;
+      }
+
+      return fallback;
+    }
+
+    function getInheritedSvgProp(element, classRules, name, fallback = "") {
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const value = getDirectSvgProp(current, classRules, name, "");
+        if (value !== "") {
+          return value;
+        }
+        current = current.parentNode;
+      }
+
+      return fallback;
+    }
+
+    function extractImages(doc) {
+      const images = Array.from(doc.querySelectorAll("image"));
+      const items = [];
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const href = getHref(img);
+
+        if (img.getAttribute("data-frame") === "true") {
+          continue;
+        }
+
+        if (!href.startsWith("data:image/")) continue;
+        if (href.startsWith("data:image/svg+xml")) continue;
+
+        items.push({
+          index: i,
+          name: "Miro image " + i,
+          href,
+          x: img.getAttribute("x") || "0",
+          y: img.getAttribute("y") || "0",
+          width: img.getAttribute("width") || "0",
+          height: img.getAttribute("height") || "0",
+          transform: getTransformChain(img)
+        });
+      }
+
+      return items;
+    }
+
+    function extractTexts(doc, classRules) {
+      const textNodes = Array.from(doc.querySelectorAll("text"));
+      const items = [];
+
+      for (let i = 0; i < textNodes.length; i++) {
+        const textNode = textNodes[i];
+
+        const value = (textNode.textContent || "").trim();
+        if (!value) continue;
+
+        items.push({
+          index: i,
+          name: "Miro text " + i,
+          text: value,
+          x: textNode.getAttribute("x") || "0",
+          y: textNode.getAttribute("y") || "0",
+          fill: getInheritedSvgProp(textNode, classRules, "fill", "#000000"),
+          fontSize: getInheritedSvgProp(textNode, classRules, "font-size", "16"),
+          fontFamily: getInheritedSvgProp(textNode, classRules, "font-family", "Arial"),
+          fontWeight: getInheritedSvgProp(textNode, classRules, "font-weight", "400"),
+          textLength: textNode.getAttribute("textLength") || "",
+          transform: getTransformChain(textNode)
+        });
+      }
+
+      return items;
+    }
+
+    function buildVectorOverlaySvg(svgText) {
+      const parser = new DOMParser();
+      const overlayDoc = parser.parseFromString(svgText, "image/svg+xml");
+
+      const parserError = overlayDoc.querySelector("parsererror");
+      if (parserError) {
+        throw new Error("SVG parse error while building vector overlay.");
+      }
+
+      // Remove images from overlay. Images are imported separately by plugin.js.
+      Array.from(overlayDoc.querySelectorAll("image")).forEach(node => {
+        node.remove();
+      });
+
+      // Remove text from overlay. Text is imported separately as editable text.
+      Array.from(overlayDoc.querySelectorAll("text")).forEach(node => {
+        node.remove();
+      });
+
+      // Remove title/desc.
+      Array.from(overlayDoc.querySelectorAll("title,desc")).forEach(node => {
+        node.remove();
+      });
+
+      const serializer = new XMLSerializer();
+      const overlaySvg = serializer.serializeToString(overlayDoc);
+
+      const bounds = measureSvgBounds(overlaySvg);
+
+      return {
+        svg: overlaySvg,
+        bounds
+      };
+    }
+
+    function measureSvgBounds(svgText) {
+      const holder = document.createElement("div");
+
+      holder.style.position = "absolute";
+      holder.style.left = "-100000px";
+      holder.style.top = "-100000px";
+      holder.style.width = "1px";
+      holder.style.height = "1px";
+      holder.style.overflow = "hidden";
+      holder.style.opacity = "0";
+      holder.style.pointerEvents = "none";
+
+      holder.innerHTML = svgText;
+      document.body.appendChild(holder);
+
+      let bounds = {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0
+      };
+
+      try {
+        const svg = holder.querySelector("svg");
+
+        if (svg && svg.getBBox) {
+          const box = svg.getBBox();
+
+          bounds = {
+            x: box.x,
+            y: box.y,
+            width: box.width,
+            height: box.height
+          };
+        }
+      } catch (err) {
+        bounds = {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0
+        };
+      }
+
+      holder.remove();
+      return bounds;
+    }
+
+    function countVectorNodesFromOverlay(overlaySvg) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(overlaySvg, "image/svg+xml");
+
+      return doc.querySelectorAll(
+        "rect,path,line,polyline,polygon,ellipse,circle,use,g"
+      ).length;
+    }
+
+    document.getElementById("import").onclick = async () => {
+      try {
+        const file = fileInput.files[0];
+
+        if (!file) {
+          log.textContent = "Choose an SVG first.";
+          return;
+        }
+
+        const svg = await file.text();
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(svg, "image/svg+xml");
+
+        const parserError = doc.querySelector("parsererror");
+        if (parserError) {
+          throw new Error("SVG parse error.");
+        }
+
+        const classRules = parseCssRules(doc);
+        const images = extractImages(doc);
+        const texts = extractTexts(doc, classRules);
+
+        const vectorOverlay = buildVectorOverlaySvg(svg);
+        const vectorOverlaySvg = vectorOverlay.svg;
+        const vectorOverlayBounds = vectorOverlay.bounds;
+        const vectorNodeCount = countVectorNodesFromOverlay(vectorOverlaySvg);
+
+        log.textContent =
+          "Loaded: " + file.name + "\n" +
+          "SVG size: " + Math.round(svg.length / 1024) + " KB\n" +
+          "Raster images: " + images.length + "\n" +
+          "Vector overlay nodes: " + vectorNodeCount + "\n" +
+          "Overlay bounds x/y: " + Math.round(vectorOverlayBounds.x) + ", " + Math.round(vectorOverlayBounds.y) + "\n" +
+          "Editable text objects: " + texts.length + "\n" +
+          "Sending data to Penpot...";
+
+        parent.postMessage({
+          type: "import-content",
+          name: file.name,
+          images,
+          vectorOverlaySvg,
+          vectorOverlayBounds,
+          vectorNodeCount,
+          texts
+        }, "*");
+
+      } catch (err) {
+        log.textContent = "UI Error: " + (err && err.message ? err.message : String(err));
+      }
+    };
+
+    window.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type === "status") {
+        log.textContent = data.message;
+      }
+    });
+  </script>
+</body>
+</html>
