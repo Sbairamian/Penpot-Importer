@@ -1,0 +1,827 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Miro SVG Importer</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      background: #1f1f1f;
+      color: #f2f2f2;
+      margin: 0;
+      padding: 16px;
+    }
+
+    h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+
+    p {
+      line-height: 1.4;
+      color: #cfcfcf;
+    }
+
+    label {
+      display: block;
+      margin-top: 14px;
+      font-size: 13px;
+      color: #ffffff;
+    }
+
+    input, button {
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    button {
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    .hint {
+      color: #bdbdbd;
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.35;
+    }
+
+    #log {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      font-size: 12px;
+      color: #9be7ff;
+      background: #111;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 350px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h2>Local Miro SVG Importer</h2>
+
+  <p>
+    Choose a local SVG file. External Miro images will be fetched through your local Node proxy.
+  </p>
+
+  <label>1. Choose the Miro SVG file</label>
+  <input id="file" type="file" accept=".svg,image/svg+xml" />
+
+  <label>2. Optional fallback: choose downloaded linked image files</label>
+  <input id="assetFiles" type="file" multiple accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg" />
+  <div class="hint">
+    Usually leave this empty. The importer first tries the local proxy.
+    Use this only if the final report says proxy fetch failed.
+    v0.9.1 maps fallback files by unique external URL, so repeated Miro URLs reuse the same selected file.
+  </div>
+
+  <br />
+  <button id="import">Import SVG Images + Vector Overlay + Text</button>
+
+  <div id="log">Waiting for SVG...</div>
+
+  <script>
+    const IMPORTER_VERSION = "v0.9.1";
+
+    const fileInput = document.getElementById("file");
+    const assetInput = document.getElementById("assetFiles");
+    const log = document.getElementById("log");
+
+    function getHref(element) {
+      return (
+        element.getAttribute("href") ||
+        element.getAttribute("xlink:href") ||
+        ""
+      );
+    }
+
+    function getTransformChain(element) {
+      const chain = [];
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const t = current.getAttribute("transform");
+        if (t) chain.unshift(t);
+        current = current.parentNode;
+      }
+
+      return chain.join(" ");
+    }
+
+    function parseStyle(styleValue) {
+      const out = {};
+      if (!styleValue) return out;
+
+      const parts = styleValue.split(";");
+
+      for (const part of parts) {
+        const idx = part.indexOf(":");
+        if (idx === -1) continue;
+
+        const key = part.slice(0, idx).trim();
+        const value = part.slice(idx + 1).trim();
+
+        if (key) out[key] = value;
+      }
+
+      return out;
+    }
+
+    function parseCssRules(doc) {
+      const classRules = {};
+      const styleNodes = Array.from(doc.querySelectorAll("style"));
+
+      for (const styleNode of styleNodes) {
+        const css = styleNode.textContent || "";
+        const regex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]+)\}/g;
+        let match;
+
+        while ((match = regex.exec(css)) !== null) {
+          const className = match[1];
+          const body = match[2];
+          classRules[className] = parseStyle(body);
+        }
+      }
+
+      return classRules;
+    }
+
+    function getClassStyleProp(element, classRules, name) {
+      const classAttr = element.getAttribute("class") || "";
+      const classes = classAttr.split(/\s+/).filter(Boolean);
+
+      for (const cls of classes) {
+        const rule = classRules[cls];
+        if (rule && rule[name]) {
+          return rule[name];
+        }
+      }
+
+      return "";
+    }
+
+    function getDirectSvgProp(element, classRules, name, fallback = "") {
+      const direct = element.getAttribute(name);
+      if (direct !== null && direct !== undefined && direct !== "") {
+        return direct;
+      }
+
+      const inlineStyle = parseStyle(element.getAttribute("style") || "");
+      if (inlineStyle[name]) {
+        return inlineStyle[name];
+      }
+
+      const classValue = getClassStyleProp(element, classRules, name);
+      if (classValue) {
+        return classValue;
+      }
+
+      return fallback;
+    }
+
+    function getInheritedSvgProp(element, classRules, name, fallback = "") {
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const value = getDirectSvgProp(current, classRules, name, "");
+        if (value !== "") {
+          return value;
+        }
+        current = current.parentNode;
+      }
+
+      return fallback;
+    }
+
+    function normalizePathToken(value) {
+      if (!value) return "";
+
+      let v = String(value).trim();
+
+      try {
+        v = decodeURIComponent(v);
+      } catch (err) {}
+
+      v = v.replace(/\\/g, "/");
+
+      const hashIndex = v.indexOf("#");
+      if (hashIndex !== -1) {
+        v = v.slice(0, hashIndex);
+      }
+
+      const queryIndex = v.indexOf("?");
+      if (queryIndex !== -1) {
+        v = v.slice(0, queryIndex);
+      }
+
+      return v.toLowerCase();
+    }
+
+    function getBaseName(value) {
+      const normalized = normalizePathToken(value);
+      const parts = normalized.split("/");
+      return parts[parts.length - 1] || normalized;
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("Failed to read file."));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("Failed to read blob."));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function fetchExternalImageThroughProxy(url) {
+      try {
+        const proxyUrl =
+          "/proxy-image?url=" + encodeURIComponent(url);
+
+        const response = await fetch(proxyUrl, {
+          method: "GET",
+          cache: "no-store"
+        });
+
+        if (!response.ok) {
+          let errorText = "";
+          try {
+            errorText = await response.text();
+          } catch (err) {}
+
+          return {
+            ok: false,
+            dataUrl: "",
+            error: "Proxy HTTP " + response.status + ". " + errorText.slice(0, 500)
+          };
+        }
+
+        const blob = await response.blob();
+
+        if (!blob || !blob.type || !blob.type.toLowerCase().startsWith("image/")) {
+          return {
+            ok: false,
+            dataUrl: "",
+            error: "Proxy response was not an image. Blob type: " + (blob && blob.type ? blob.type : "unknown")
+          };
+        }
+
+        const dataUrl = await blobToDataUrl(blob);
+
+        return {
+          ok: true,
+          dataUrl,
+          error: ""
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          dataUrl: "",
+          error: err && err.message ? err.message : String(err)
+        };
+      }
+    }
+
+    async function buildAssetData(files) {
+      const map = new Map();
+      const ordered = [];
+
+      for (const file of files) {
+        const dataUrl = await fileToDataUrl(file);
+
+        const asset = {
+          name: file.name,
+          size: file.size,
+          type: file.type || "",
+          dataUrl
+        };
+
+        ordered.push(asset);
+
+        const fileNameKey = normalizePathToken(file.name);
+        const baseNameKey = getBaseName(file.name);
+
+        map.set(fileNameKey, asset);
+        map.set(baseNameKey, asset);
+
+        if (file.webkitRelativePath) {
+          const relativeKey = normalizePathToken(file.webkitRelativePath);
+          const relativeBaseKey = getBaseName(file.webkitRelativePath);
+
+          map.set(relativeKey, asset);
+          map.set(relativeBaseKey, asset);
+        }
+      }
+
+      return {
+        map,
+        ordered
+      };
+    }
+
+    function isExternalImageHref(href) {
+      if (!href) return false;
+
+      const lower = href.toLowerCase();
+
+      if (lower.startsWith("data:image/")) return false;
+      if (lower.startsWith("#")) return false;
+
+      return true;
+    }
+
+    function summarizeImages(doc) {
+      const imageNodes = Array.from(doc.querySelectorAll("image"));
+
+      let embeddedRaster = 0;
+      let embeddedSvg = 0;
+      let external = 0;
+      let dataFrame = 0;
+
+      for (const img of imageNodes) {
+        const href = getHref(img);
+        const hrefLower = href.toLowerCase();
+        const isDataFrame = img.getAttribute("data-frame") === "true";
+
+        if (isDataFrame) {
+          dataFrame++;
+        }
+
+        if (hrefLower.startsWith("data:image/svg+xml")) {
+          embeddedSvg++;
+        } else if (hrefLower.startsWith("data:image/")) {
+          embeddedRaster++;
+        } else if (href) {
+          external++;
+        }
+      }
+
+      return {
+        indexVersion: IMPORTER_VERSION,
+
+        total: imageNodes.length,
+        embeddedRaster,
+        embeddedSvg,
+        external,
+        dataFrame,
+
+        externalProxyFetched: 0,
+        externalProxyFetchFailed: 0,
+
+        externalMatched: 0,
+        externalMatchedByName: 0,
+        externalMatchedByUniqueUrlOrder: 0,
+        externalMatchedByOrder: 0,
+        externalReusedByUniqueUrl: 0,
+        externalUnmatched: 0,
+
+        uniqueExternalUrlCount: 0,
+
+        externalRefs: [],
+        externalProxyFetchedRefs: [],
+        externalProxyFetchFailedRefs: [],
+        externalUnmatchedRefs: [],
+
+        externalAssignments: []
+      };
+    }
+
+    function addExternalAssignment(imageSummary, data) {
+      imageSummary.externalAssignments.push({
+        imageElementIndex: data.imageElementIndex,
+        method: data.method,
+        uniqueExternalIndex: data.uniqueExternalIndex,
+        svgHref: data.svgHref || "",
+        selectedFileName: data.selectedFileName || "",
+        selectedFileSize: data.selectedFileSize || 0,
+        selectedFileType: data.selectedFileType || "",
+        x: data.x || "0",
+        y: data.y || "0",
+        width: data.width || "0",
+        height: data.height || "0",
+        proxyError: data.proxyError || ""
+      });
+    }
+
+    async function extractImages(doc, assetData, imageSummary) {
+      const images = Array.from(doc.querySelectorAll("image"));
+      const items = [];
+
+      const uniqueUrlToAsset = new Map();
+      const uniqueUrlToIndex = new Map();
+      let nextUniqueExternalIndex = 0;
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const originalHref = getHref(img);
+        const hrefLower = originalHref.toLowerCase();
+
+        let href = originalHref;
+
+        const imageX = img.getAttribute("x") || "0";
+        const imageY = img.getAttribute("y") || "0";
+        const imageWidth = img.getAttribute("width") || "0";
+        const imageHeight = img.getAttribute("height") || "0";
+
+        if (hrefLower.startsWith("data:image/") && !hrefLower.startsWith("data:image/svg+xml")) {
+          // Embedded raster image. Keep href as-is.
+        }
+
+        else if (hrefLower.startsWith("data:image/svg+xml")) {
+          // Embedded SVG image. Let vector overlay handle this kind of content.
+          continue;
+        }
+
+        else if (isExternalImageHref(originalHref)) {
+          imageSummary.externalRefs.push(originalHref);
+
+          const normalizedExternalUrl = normalizePathToken(originalHref);
+
+          let uniqueExternalIndex;
+
+          if (uniqueUrlToIndex.has(normalizedExternalUrl)) {
+            uniqueExternalIndex = uniqueUrlToIndex.get(normalizedExternalUrl);
+          } else {
+            uniqueExternalIndex = nextUniqueExternalIndex;
+            uniqueUrlToIndex.set(normalizedExternalUrl, uniqueExternalIndex);
+            nextUniqueExternalIndex++;
+          }
+
+          log.textContent =
+            "Trying local proxy fetch for external image...\n\n" +
+            "SVG image element index: " + i + "\n" +
+            "Unique external URL #: " + (uniqueExternalIndex + 1) + "\n" +
+            "URL: " + originalHref + "\n\n" +
+            "If this fails, the importer will try optional manual fallback files.";
+
+          const proxyResult = await fetchExternalImageThroughProxy(originalHref);
+
+          if (proxyResult.ok && proxyResult.dataUrl) {
+            imageSummary.externalProxyFetched++;
+            imageSummary.externalProxyFetchedRefs.push(originalHref);
+            href = proxyResult.dataUrl;
+
+            const fetchedAsset = {
+              name: "proxy-fetched unique URL #" + (uniqueExternalIndex + 1),
+              size: 0,
+              type: "image/proxy",
+              dataUrl: proxyResult.dataUrl
+            };
+
+            uniqueUrlToAsset.set(normalizedExternalUrl, fetchedAsset);
+
+            addExternalAssignment(imageSummary, {
+              imageElementIndex: i,
+              method: "local proxy fetch",
+              uniqueExternalIndex: uniqueExternalIndex + 1,
+              svgHref: originalHref,
+              x: imageX,
+              y: imageY,
+              width: imageWidth,
+              height: imageHeight
+            });
+          } else {
+            imageSummary.externalProxyFetchFailed++;
+            imageSummary.externalProxyFetchFailedRefs.push(originalHref);
+
+            const exactKey = normalizePathToken(originalHref);
+            const baseKey = getBaseName(originalHref);
+
+            let matchedAsset =
+              assetData.map.get(exactKey) ||
+              assetData.map.get(baseKey) ||
+              null;
+
+            if (matchedAsset) {
+              imageSummary.externalMatched++;
+              imageSummary.externalMatchedByName++;
+              href = matchedAsset.dataUrl;
+
+              uniqueUrlToAsset.set(normalizedExternalUrl, matchedAsset);
+
+              addExternalAssignment(imageSummary, {
+                imageElementIndex: i,
+                method: "manual filename/path match",
+                uniqueExternalIndex: uniqueExternalIndex + 1,
+                svgHref: originalHref,
+                selectedFileName: matchedAsset.name,
+                selectedFileSize: matchedAsset.size,
+                selectedFileType: matchedAsset.type,
+                x: imageX,
+                y: imageY,
+                width: imageWidth,
+                height: imageHeight,
+                proxyError: proxyResult.error
+              });
+            } else if (uniqueUrlToAsset.has(normalizedExternalUrl)) {
+              matchedAsset = uniqueUrlToAsset.get(normalizedExternalUrl);
+
+              imageSummary.externalMatched++;
+              imageSummary.externalReusedByUniqueUrl++;
+              href = matchedAsset.dataUrl;
+
+              addExternalAssignment(imageSummary, {
+                imageElementIndex: i,
+                method: "reuse previous unique URL file",
+                uniqueExternalIndex: uniqueExternalIndex + 1,
+                svgHref: originalHref,
+                selectedFileName: matchedAsset.name,
+                selectedFileSize: matchedAsset.size,
+                selectedFileType: matchedAsset.type,
+                x: imageX,
+                y: imageY,
+                width: imageWidth,
+                height: imageHeight,
+                proxyError: proxyResult.error
+              });
+            } else if (uniqueExternalIndex < assetData.ordered.length) {
+              matchedAsset = assetData.ordered[uniqueExternalIndex];
+
+              imageSummary.externalMatched++;
+              imageSummary.externalMatchedByUniqueUrlOrder++;
+              imageSummary.externalMatchedByOrder++;
+              href = matchedAsset.dataUrl;
+
+              uniqueUrlToAsset.set(normalizedExternalUrl, matchedAsset);
+
+              addExternalAssignment(imageSummary, {
+                imageElementIndex: i,
+                method: "manual unique-url order",
+                uniqueExternalIndex: uniqueExternalIndex + 1,
+                svgHref: originalHref,
+                selectedFileName: matchedAsset.name,
+                selectedFileSize: matchedAsset.size,
+                selectedFileType: matchedAsset.type,
+                x: imageX,
+                y: imageY,
+                width: imageWidth,
+                height: imageHeight,
+                proxyError: proxyResult.error
+              });
+            } else {
+              imageSummary.externalUnmatched++;
+              imageSummary.externalUnmatchedRefs.push(originalHref);
+
+              addExternalAssignment(imageSummary, {
+                imageElementIndex: i,
+                method: "unmatched",
+                uniqueExternalIndex: uniqueExternalIndex + 1,
+                svgHref: originalHref,
+                x: imageX,
+                y: imageY,
+                width: imageWidth,
+                height: imageHeight,
+                proxyError: proxyResult.error
+              });
+
+              continue;
+            }
+          }
+        }
+
+        else {
+          continue;
+        }
+
+        items.push({
+          index: i,
+          name: "Miro image " + i,
+          href,
+          originalHref,
+          x: imageX,
+          y: imageY,
+          width: imageWidth,
+          height: imageHeight,
+          preserveAspectRatio: img.getAttribute("preserveAspectRatio") || "",
+          transform: getTransformChain(img),
+          dataFrame: img.getAttribute("data-frame") || ""
+        });
+      }
+
+      imageSummary.uniqueExternalUrlCount = nextUniqueExternalIndex;
+
+      return items;
+    }
+
+    function extractTexts(doc, classRules) {
+      const textNodes = Array.from(doc.querySelectorAll("text"));
+      const items = [];
+
+      for (let i = 0; i < textNodes.length; i++) {
+        const textNode = textNodes[i];
+
+        const value = (textNode.textContent || "").trim();
+        if (!value) continue;
+
+        items.push({
+          index: i,
+          name: "Miro text " + i,
+          text: value,
+          x: textNode.getAttribute("x") || "0",
+          y: textNode.getAttribute("y") || "0",
+          fill: getInheritedSvgProp(textNode, classRules, "fill", "#000000"),
+          fontSize: getInheritedSvgProp(textNode, classRules, "font-size", "16"),
+          fontFamily: getInheritedSvgProp(textNode, classRules, "font-family", "Arial"),
+          fontWeight: getInheritedSvgProp(textNode, classRules, "font-weight", "400"),
+          textLength: textNode.getAttribute("textLength") || "",
+          transform: getTransformChain(textNode)
+        });
+      }
+
+      return items;
+    }
+
+    function buildVectorOverlaySvg(svgText) {
+      const parser = new DOMParser();
+      const overlayDoc = parser.parseFromString(svgText, "image/svg+xml");
+
+      const parserError = overlayDoc.querySelector("parsererror");
+      if (parserError) {
+        throw new Error("SVG parse error while building vector overlay.");
+      }
+
+      Array.from(overlayDoc.querySelectorAll("image")).forEach(node => {
+        node.remove();
+      });
+
+      Array.from(overlayDoc.querySelectorAll("text")).forEach(node => {
+        node.remove();
+      });
+
+      Array.from(overlayDoc.querySelectorAll("title,desc")).forEach(node => {
+        node.remove();
+      });
+
+      const serializer = new XMLSerializer();
+      const overlaySvg = serializer.serializeToString(overlayDoc);
+
+      const bounds = measureSvgBounds(overlaySvg);
+
+      return {
+        svg: overlaySvg,
+        bounds
+      };
+    }
+
+    function measureSvgBounds(svgText) {
+      const holder = document.createElement("div");
+
+      holder.style.position = "absolute";
+      holder.style.left = "-100000px";
+      holder.style.top = "-100000px";
+      holder.style.width = "1px";
+      holder.style.height = "1px";
+      holder.style.overflow = "hidden";
+      holder.style.opacity = "0";
+      holder.style.pointerEvents = "none";
+
+      holder.innerHTML = svgText;
+      document.body.appendChild(holder);
+
+      let bounds = {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0
+      };
+
+      try {
+        const svg = holder.querySelector("svg");
+
+        if (svg && svg.getBBox) {
+          const box = svg.getBBox();
+
+          bounds = {
+            x: box.x,
+            y: box.y,
+            width: box.width,
+            height: box.height
+          };
+        }
+      } catch (err) {
+        bounds = {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0
+        };
+      }
+
+      holder.remove();
+      return bounds;
+    }
+
+    function countVectorNodesFromOverlay(overlaySvg) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(overlaySvg, "image/svg+xml");
+
+      return doc.querySelectorAll(
+        "rect,path,line,polyline,polygon,ellipse,circle,use,g"
+      ).length;
+    }
+
+    document.getElementById("import").onclick = async () => {
+      try {
+        const file = fileInput.files[0];
+
+        if (!file) {
+          log.textContent = "Choose an SVG first.";
+          return;
+        }
+
+        const assetFiles = Array.from(assetInput.files || []);
+
+        log.textContent =
+          "Reading files...\n" +
+          "Version: " + IMPORTER_VERSION + "\n" +
+          "SVG: " + file.name + "\n" +
+          "Manual fallback linked image files selected: " + assetFiles.length;
+
+        const svg = await file.text();
+        const assetData = await buildAssetData(assetFiles);
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(svg, "image/svg+xml");
+
+        const parserError = doc.querySelector("parsererror");
+        if (parserError) {
+          throw new Error("SVG parse error.");
+        }
+
+        const classRules = parseCssRules(doc);
+        const imageSummary = summarizeImages(doc);
+        const images = await extractImages(doc, assetData, imageSummary);
+        const texts = extractTexts(doc, classRules);
+
+        const vectorOverlay = buildVectorOverlaySvg(svg);
+        const vectorOverlaySvg = vectorOverlay.svg;
+        const vectorOverlayBounds = vectorOverlay.bounds;
+        const vectorNodeCount = countVectorNodesFromOverlay(vectorOverlaySvg);
+
+        log.textContent =
+          "Loaded: " + file.name + "\n" +
+          "Version: " + IMPORTER_VERSION + "\n" +
+          "SVG size: " + Math.round(svg.length / 1024) + " KB\n\n" +
+
+          "Image summary:\n" +
+          "All <image> elements: " + imageSummary.total + "\n" +
+          "Embedded raster image elements: " + imageSummary.embeddedRaster + "\n" +
+          "Embedded SVG image elements: " + imageSummary.embeddedSvg + "\n" +
+          "External/linked image refs: " + imageSummary.external + "\n" +
+          "Unique external URLs: " + imageSummary.uniqueExternalUrlCount + "\n" +
+          "External images proxy-fetched: " + imageSummary.externalProxyFetched + "\n" +
+          "External proxy fetch failed: " + imageSummary.externalProxyFetchFailed + "\n" +
+          "External image refs manually matched: " + imageSummary.externalMatched + "\n" +
+          "Matched by filename/path: " + imageSummary.externalMatchedByName + "\n" +
+          "Matched by unique URL order: " + imageSummary.externalMatchedByUniqueUrlOrder + "\n" +
+          "Reused by unique URL: " + imageSummary.externalReusedByUniqueUrl + "\n" +
+          "External image refs unmatched: " + imageSummary.externalUnmatched + "\n" +
+          "data-frame image elements: " + imageSummary.dataFrame + "\n" +
+          "Raster images sent to Penpot: " + images.length + "\n\n" +
+
+          "Vector/text summary:\n" +
+          "Vector overlay nodes: " + vectorNodeCount + "\n" +
+          "Overlay bounds x/y: " + Math.round(vectorOverlayBounds.x) + ", " + Math.round(vectorOverlayBounds.y) + "\n" +
+          "Editable text objects: " + texts.length + "\n\n" +
+
+          "Sending data to Penpot...";
+
+        parent.postMessage({
+          type: "import-content",
+          name: file.name,
+          imageSummary,
+          images,
+          vectorOverlaySvg,
+          vectorOverlayBounds,
+          vectorNodeCount,
+          texts
+        }, "*");
+
+      } catch (err) {
+        log.textContent = "UI Error: " + (err && err.message ? err.message : String(err));
+      }
+    };
+
+    window.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type === "status") {
+        log.textContent = data.message;
+      }
+    });
+  </script>
+
+  <!-- Local Miro SVG Importer index.html version: v0.9.1 -->
+</body>
+</html>
