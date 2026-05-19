@@ -1,0 +1,1494 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Miro SVG Importer</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      background: #1f1f1f;
+      color: #f2f2f2;
+      margin: 0;
+      padding: 16px;
+    }
+
+    h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+
+    p {
+      line-height: 1.4;
+      color: #cfcfcf;
+    }
+
+    label {
+      display: block;
+      margin-top: 14px;
+      font-size: 13px;
+      color: #ffffff;
+    }
+
+    input, button {
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    button {
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    a {
+      color: #9be7ff;
+      word-break: break-all;
+    }
+
+    .hint {
+      color: #bdbdbd;
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.35;
+    }
+
+    .panel {
+      margin-top: 16px;
+      background: #151515;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .external-card {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #3a3a3a;
+      border-radius: 8px;
+      background: #202020;
+    }
+
+    .external-title {
+      font-weight: bold;
+      color: #ffffff;
+      margin-bottom: 6px;
+    }
+
+    .external-meta {
+      color: #cfcfcf;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-bottom: 8px;
+    }
+
+    .external-url {
+      color: #9be7ff;
+      font-size: 12px;
+      word-break: break-all;
+      margin: 6px 0;
+    }
+
+    #log {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      font-size: 12px;
+      color: #9be7ff;
+      background: #111;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 350px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h2>Local Miro SVG Importer</h2>
+
+  <p>
+    v0.9.2-safe5 keeps the stable v0.9.2 import behavior and adds direct image clip-path cropping.
+  </p>
+
+  <label>1. Choose the Miro SVG file</label>
+  <input id="file" type="file" accept=".svg,image/svg+xml" />
+
+  <div id="externalPanel" class="panel" style="display:none;">
+    <div class="external-title">External image URLs found</div>
+    <div class="hint">
+      Use these slots for password-protected Miro images. This version does not guess by file order.
+      It can also match batch files named by Miro resource ID, like 3074457346247371882.png.
+    </div>
+    <div id="externalList"></div>
+  </div>
+
+  <input
+    id="assetFiles"
+    type="file"
+    multiple
+    accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg"
+    style="display:none;"
+  />
+
+  <br />
+  <button id="import">Import SVG Images + Vector Overlay + Text</button>
+
+  <div id="log">Waiting for SVG...</div>
+
+  <script>
+    const IMPORTER_VERSION = "v0.9.2-safe5";
+
+    const fileInput = document.getElementById("file");
+    const assetInput = document.getElementById("assetFiles");
+    const log = document.getElementById("log");
+    const externalPanel = document.getElementById("externalPanel");
+    const externalList = document.getElementById("externalList");
+
+    let scannedExternalInfos = [];
+
+    function getHref(element) {
+      return (
+        element.getAttribute("href") ||
+        element.getAttribute("xlink:href") ||
+        ""
+      );
+    }
+
+    function toNumber(value, fallback) {
+      if (value === null || value === undefined || value === "") return fallback;
+      const n = parseFloat(String(value).replace("px", ""));
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function matrixToString(m) {
+      return "matrix(" +
+        m[0] + " " +
+        m[1] + " " +
+        m[2] + " " +
+        m[3] + " " +
+        m[4] + " " +
+        m[5] +
+      ")";
+    }
+
+    function parseStyle(styleValue) {
+      const out = {};
+      if (!styleValue) return out;
+
+      const parts = styleValue.split(";");
+
+      for (const part of parts) {
+        const idx = part.indexOf(":");
+        if (idx === -1) continue;
+
+        const key = part.slice(0, idx).trim();
+        const value = part.slice(idx + 1).trim();
+
+        if (key) out[key] = value;
+      }
+
+      return out;
+    }
+
+    function parseCssRules(doc) {
+      const classRules = {};
+      const styleNodes = Array.from(doc.querySelectorAll("style"));
+
+      for (const styleNode of styleNodes) {
+        const css = styleNode.textContent || "";
+        const regex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]+)\}/g;
+        let match;
+
+        while ((match = regex.exec(css)) !== null) {
+          const className = match[1];
+          const body = match[2];
+          classRules[className] = parseStyle(body);
+        }
+      }
+
+      return classRules;
+    }
+
+    function getClassStyleProp(element, classRules, name) {
+      const classAttr = element.getAttribute("class") || "";
+      const classes = classAttr.split(/\s+/).filter(Boolean);
+
+      for (const cls of classes) {
+        const rule = classRules[cls];
+        if (rule && rule[name]) {
+          return rule[name];
+        }
+      }
+
+      return "";
+    }
+
+    function getDirectSvgProp(element, classRules, name, fallback = "") {
+      const direct = element.getAttribute(name);
+      if (direct !== null && direct !== undefined && direct !== "") {
+        return direct;
+      }
+
+      const inlineStyle = parseStyle(element.getAttribute("style") || "");
+      if (inlineStyle[name]) {
+        return inlineStyle[name];
+      }
+
+      const classValue = getClassStyleProp(element, classRules, name);
+      if (classValue) {
+        return classValue;
+      }
+
+      return fallback;
+    }
+
+    function getInheritedSvgProp(element, classRules, name, fallback = "") {
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const value = getDirectSvgProp(current, classRules, name, "");
+        if (value !== "") {
+          return value;
+        }
+        current = current.parentNode;
+      }
+
+      return fallback;
+    }
+
+    function getViewBoxParts(svgElement) {
+      const viewBox = svgElement.getAttribute("viewBox");
+      if (!viewBox) return null;
+
+      const parts = viewBox
+        .split(/[\s,]+/)
+        .filter(Boolean)
+        .map(v => parseFloat(v));
+
+      if (parts.length < 4 || !parts.every(Number.isFinite)) {
+        return null;
+      }
+
+      return {
+        x: parts[0],
+        y: parts[1],
+        width: parts[2],
+        height: parts[3]
+      };
+    }
+
+    function hasSvgAncestor(element) {
+      let parent = element.parentNode;
+
+      while (parent) {
+        if (
+          parent.nodeType === 1 &&
+          parent.tagName &&
+          parent.tagName.toLowerCase() === "svg"
+        ) {
+          return true;
+        }
+
+        parent = parent.parentNode;
+      }
+
+      return false;
+    }
+
+    function isNestedSvgElement(element) {
+      if (!element || !element.tagName) return false;
+      if (element.tagName.toLowerCase() !== "svg") return false;
+      return hasSvgAncestor(element);
+    }
+
+    function getNestedSvgViewportTransform(element) {
+      if (!isNestedSvgElement(element)) {
+        return "";
+      }
+
+      const viewBox = getViewBoxParts(element);
+      if (!viewBox || viewBox.width === 0 || viewBox.height === 0) {
+        return "";
+      }
+
+      const x = toNumber(element.getAttribute("x"), 0);
+      const y = toNumber(element.getAttribute("y"), 0);
+      const width = toNumber(element.getAttribute("width"), viewBox.width);
+      const height = toNumber(element.getAttribute("height"), viewBox.height);
+
+      let preserveAspectRatio = element.getAttribute("preserveAspectRatio") || "xMidYMid meet";
+      preserveAspectRatio = preserveAspectRatio.trim();
+
+      let sx = width / viewBox.width;
+      let sy = height / viewBox.height;
+
+      let tx = x - viewBox.x * sx;
+      let ty = y - viewBox.y * sy;
+
+      if (preserveAspectRatio !== "none") {
+        const meetOrSlice = preserveAspectRatio.includes("slice") ? "slice" : "meet";
+        const scale = meetOrSlice === "slice" ? Math.max(sx, sy) : Math.min(sx, sy);
+
+        let alignX = "Mid";
+        let alignY = "Mid";
+
+        const alignMatch = preserveAspectRatio.match(/x(Min|Mid|Max)Y(Min|Mid|Max)/);
+
+        if (alignMatch) {
+          alignX = alignMatch[1];
+          alignY = alignMatch[2];
+        }
+
+        const extraX = width - viewBox.width * scale;
+        const extraY = height - viewBox.height * scale;
+
+        let offsetX = 0;
+        let offsetY = 0;
+
+        if (alignX === "Mid") offsetX = extraX / 2;
+        if (alignX === "Max") offsetX = extraX;
+
+        if (alignY === "Mid") offsetY = extraY / 2;
+        if (alignY === "Max") offsetY = extraY;
+
+        sx = scale;
+        sy = scale;
+        tx = x + offsetX - viewBox.x * scale;
+        ty = y + offsetY - viewBox.y * scale;
+      }
+
+      return matrixToString([sx, 0, 0, sy, tx, ty]);
+    }
+
+    function getTransformChain(element) {
+      const chain = [];
+      let current = element;
+
+      while (current && current.nodeType === 1) {
+        const tag = current.tagName ? current.tagName.toLowerCase() : "";
+
+        if (tag === "svg") {
+          const viewportTransform = getNestedSvgViewportTransform(current);
+          if (viewportTransform) {
+            chain.unshift(viewportTransform);
+          }
+        }
+
+        const t = current.getAttribute("transform");
+        if (t) chain.unshift(t);
+
+        current = current.parentNode;
+      }
+
+      return chain.join(" ");
+    }
+
+    function normalizePathToken(value) {
+      if (!value) return "";
+
+      let v = String(value).trim();
+
+      try {
+        v = decodeURIComponent(v);
+      } catch (err) {}
+
+      v = v.replace(/\\/g, "/");
+
+      const hashIndex = v.indexOf("#");
+      if (hashIndex !== -1) {
+        v = v.slice(0, hashIndex);
+      }
+
+      const queryIndex = v.indexOf("?");
+      if (queryIndex !== -1) {
+        v = v.slice(0, queryIndex);
+      }
+
+      return v.toLowerCase();
+    }
+
+    function getBaseName(value) {
+      const normalized = normalizePathToken(value);
+      const parts = normalized.split("/");
+      return parts[parts.length - 1] || normalized;
+    }
+
+    function getFileStem(value) {
+      const base = getBaseName(value);
+      const dot = base.lastIndexOf(".");
+      if (dot <= 0) return base;
+      return base.slice(0, dot);
+    }
+
+    function extractMiroResourceId(value) {
+      if (!value) return "";
+
+      let v = String(value);
+
+      try {
+        v = decodeURIComponent(v);
+      } catch (err) {}
+
+      const match = v.match(/\/resources\/([^\/?#]+)\/files\/created/i);
+      if (!match) return "";
+
+      return String(match[1] || "").trim();
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("Failed to read file."));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("Failed to read blob."));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function imageDataUrlToElement(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("Could not load image data URL."));
+        img.src = dataUrl;
+      });
+    }
+
+    async function cropImageDataUrl(dataUrl, crop) {
+      const source = await imageDataUrlToElement(dataUrl);
+
+      const naturalWidth = source.naturalWidth || source.width;
+      const naturalHeight = source.naturalHeight || source.height;
+
+      let sx = Math.round(crop.sourceX);
+      let sy = Math.round(crop.sourceY);
+      let sw = Math.round(crop.sourceWidth);
+      let sh = Math.round(crop.sourceHeight);
+
+      sx = Math.max(0, Math.min(sx, naturalWidth - 1));
+      sy = Math.max(0, Math.min(sy, naturalHeight - 1));
+      sw = Math.max(1, Math.min(sw, naturalWidth - sx));
+      sh = Math.max(1, Math.min(sh, naturalHeight - sy));
+
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh);
+
+      return canvas.toDataURL("image/png");
+    }
+
+    async function fetchExternalImageThroughProxy(url) {
+      try {
+        const proxyUrl = "/proxy-image?url=" + encodeURIComponent(url);
+
+        const response = await fetch(proxyUrl, {
+          method: "GET",
+          cache: "no-store"
+        });
+
+        if (!response.ok) {
+          let errorText = "";
+          try {
+            errorText = await response.text();
+          } catch (err) {}
+
+          return {
+            ok: false,
+            dataUrl: "",
+            error: "Proxy HTTP " + response.status + ". " + errorText.slice(0, 500)
+          };
+        }
+
+        const blob = await response.blob();
+
+        if (!blob || !blob.type || !blob.type.toLowerCase().startsWith("image/")) {
+          return {
+            ok: false,
+            dataUrl: "",
+            error: "Proxy response was not an image. Blob type: " + (blob && blob.type ? blob.type : "unknown")
+          };
+        }
+
+        const dataUrl = await blobToDataUrl(blob);
+
+        return {
+          ok: true,
+          dataUrl,
+          error: ""
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          dataUrl: "",
+          error: err && err.message ? err.message : String(err)
+        };
+      }
+    }
+
+    async function buildAssetData(files) {
+      const map = new Map();
+      const ordered = [];
+
+      for (const file of files) {
+        const dataUrl = await fileToDataUrl(file);
+
+        const asset = {
+          name: file.name,
+          size: file.size,
+          type: file.type || "",
+          dataUrl
+        };
+
+        ordered.push(asset);
+
+        const fileNameKey = normalizePathToken(file.name);
+        const baseNameKey = getBaseName(file.name);
+        const stemKey = getFileStem(file.name);
+
+        map.set(fileNameKey, asset);
+        map.set(baseNameKey, asset);
+        map.set(stemKey, asset);
+
+        if (file.webkitRelativePath) {
+          const relativeKey = normalizePathToken(file.webkitRelativePath);
+          const relativeBaseKey = getBaseName(file.webkitRelativePath);
+          const relativeStemKey = getFileStem(file.webkitRelativePath);
+
+          map.set(relativeKey, asset);
+          map.set(relativeBaseKey, asset);
+          map.set(relativeStemKey, asset);
+        }
+      }
+
+      return {
+        map,
+        ordered
+      };
+    }
+
+    async function buildSlotAssetData() {
+      const map = new Map();
+
+      const inputs = Array.from(document.querySelectorAll("[data-external-url-key]"));
+
+      for (const input of inputs) {
+        const key = input.getAttribute("data-external-url-key") || "";
+        const file = input.files && input.files[0] ? input.files[0] : null;
+
+        if (!key || !file) continue;
+
+        const dataUrl = await fileToDataUrl(file);
+
+        map.set(key, {
+          name: file.name,
+          size: file.size,
+          type: file.type || "",
+          dataUrl
+        });
+      }
+
+      return map;
+    }
+
+    function isExternalImageHref(href) {
+      if (!href) return false;
+
+      const lower = href.toLowerCase();
+
+      if (lower.startsWith("data:image/")) return false;
+      if (lower.startsWith("#")) return false;
+
+      return true;
+    }
+
+    function getClipPathIdFromValue(value) {
+      if (!value) return "";
+      const match = String(value).match(/url\(\s*#([^)]+)\s*\)/);
+      if (!match) return "";
+      return String(match[1] || "").replace(/['"]/g, "").trim();
+    }
+
+    function measureClipPathBBox(doc, clipPathId) {
+      const clipPath = doc.getElementById(clipPathId);
+      if (!clipPath) return null;
+
+      const tempSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      tempSvg.setAttribute("width", "10000");
+      tempSvg.setAttribute("height", "10000");
+      tempSvg.setAttribute("viewBox", "-5000 -5000 20000 20000");
+      tempSvg.style.position = "absolute";
+      tempSvg.style.left = "-100000px";
+      tempSvg.style.top = "-100000px";
+      tempSvg.style.width = "1px";
+      tempSvg.style.height = "1px";
+      tempSvg.style.overflow = "hidden";
+      tempSvg.style.opacity = "0";
+      tempSvg.style.pointerEvents = "none";
+
+      const defs = doc.querySelector("defs");
+      if (defs) {
+        try {
+          tempSvg.appendChild(defs.cloneNode(true));
+        } catch (err) {}
+      }
+
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+
+      const children = Array.from(clipPath.childNodes);
+      for (const child of children) {
+        try {
+          g.appendChild(child.cloneNode(true));
+        } catch (err) {}
+      }
+
+      tempSvg.appendChild(g);
+      document.body.appendChild(tempSvg);
+
+      let box = null;
+
+      try {
+        const bbox = g.getBBox();
+
+        if (
+          Number.isFinite(bbox.x) &&
+          Number.isFinite(bbox.y) &&
+          Number.isFinite(bbox.width) &&
+          Number.isFinite(bbox.height) &&
+          bbox.width > 0 &&
+          bbox.height > 0
+        ) {
+          box = {
+            x: bbox.x,
+            y: bbox.y,
+            width: bbox.width,
+            height: bbox.height
+          };
+        }
+      } catch (err) {
+        box = null;
+      }
+
+      tempSvg.remove();
+
+      return box;
+    }
+
+    async function applyDirectClipPathCropIfNeeded(doc, classRules, img, href, imageSummary) {
+      const directClipPath = getDirectSvgProp(img, classRules, "clip-path", "");
+      const clipPathId = getClipPathIdFromValue(directClipPath);
+
+      const originalX = toNumber(img.getAttribute("x"), 0);
+      const originalY = toNumber(img.getAttribute("y"), 0);
+      const originalWidth = toNumber(img.getAttribute("width"), 0);
+      const originalHeight = toNumber(img.getAttribute("height"), 0);
+
+      const fallback = {
+        href,
+        x: img.getAttribute("x") || "0",
+        y: img.getAttribute("y") || "0",
+        width: img.getAttribute("width") || "0",
+        height: img.getAttribute("height") || "0",
+        transform: getTransformChain(img),
+        clipApplied: false,
+        clipPathId: clipPathId || "",
+        clipError: ""
+      };
+
+      if (!clipPathId) {
+        return fallback;
+      }
+
+      imageSummary.directClipPathImagesFound++;
+
+      const clipBox = measureClipPathBBox(doc, clipPathId);
+
+      if (!clipBox) {
+        imageSummary.directClipPathCropFailed++;
+        fallback.clipError = "Could not measure clipPath " + clipPathId;
+        return fallback;
+      }
+
+      if (originalWidth <= 0 || originalHeight <= 0) {
+        imageSummary.directClipPathCropFailed++;
+        fallback.clipError = "Original image width/height invalid.";
+        return fallback;
+      }
+
+      const visibleX = Math.max(originalX, clipBox.x);
+      const visibleY = Math.max(originalY, clipBox.y);
+      const visibleRight = Math.min(originalX + originalWidth, clipBox.x + clipBox.width);
+      const visibleBottom = Math.min(originalY + originalHeight, clipBox.y + clipBox.height);
+
+      const visibleWidth = visibleRight - visibleX;
+      const visibleHeight = visibleBottom - visibleY;
+
+      if (visibleWidth <= 0 || visibleHeight <= 0) {
+        imageSummary.directClipPathCropFailed++;
+        fallback.clipError =
+          "clipPath " + clipPathId +
+          " did not overlap image. clipBox x=" + clipBox.x +
+          " y=" + clipBox.y +
+          " w=" + clipBox.width +
+          " h=" + clipBox.height;
+        return fallback;
+      }
+
+      try {
+        const source = await imageDataUrlToElement(href);
+        const naturalWidth = source.naturalWidth || source.width;
+        const naturalHeight = source.naturalHeight || source.height;
+
+        const crop = {
+          sourceX: ((visibleX - originalX) / originalWidth) * naturalWidth,
+          sourceY: ((visibleY - originalY) / originalHeight) * naturalHeight,
+          sourceWidth: (visibleWidth / originalWidth) * naturalWidth,
+          sourceHeight: (visibleHeight / originalHeight) * naturalHeight
+        };
+
+        const croppedHref = await cropImageDataUrl(href, crop);
+
+        imageSummary.directClipPathImagesCropped++;
+
+        return {
+          href: croppedHref,
+          x: String(visibleX),
+          y: String(visibleY),
+          width: String(visibleWidth),
+          height: String(visibleHeight),
+          transform: getTransformChain(img),
+          clipApplied: true,
+          clipPathId,
+          clipError: ""
+        };
+      } catch (err) {
+        imageSummary.directClipPathCropFailed++;
+        fallback.clipError = err && err.message ? err.message : String(err);
+        return fallback;
+      }
+    }
+
+    function collectImageStructureDiagnostics(doc, classRules) {
+      const imageNodes = Array.from(doc.querySelectorAll("image"));
+
+      const clipPathNodes = Array.from(doc.querySelectorAll("clipPath")).length;
+      const maskNodes = Array.from(doc.querySelectorAll("mask")).length;
+      const useNodes = Array.from(doc.querySelectorAll("use")).length;
+
+      let imagesWithDirectClipPath = 0;
+      let embeddedSvgImageObjects = 0;
+
+      for (const img of imageNodes) {
+        const href = getHref(img);
+        const directClip = getDirectSvgProp(img, classRules, "clip-path", "");
+
+        if (directClip) imagesWithDirectClipPath++;
+        if (href.toLowerCase().startsWith("data:image/svg+xml")) embeddedSvgImageObjects++;
+      }
+
+      return {
+        clipPathNodes,
+        maskNodes,
+        useNodes,
+        imagesWithDirectClipPath,
+        embeddedSvgImageObjects
+      };
+    }
+
+    function summarizeImages(doc, structureDiagnostics) {
+      const imageNodes = Array.from(doc.querySelectorAll("image"));
+
+      let embeddedRaster = 0;
+      let embeddedSvg = 0;
+      let external = 0;
+      let dataFrame = 0;
+
+      for (const img of imageNodes) {
+        const href = getHref(img);
+        const hrefLower = href.toLowerCase();
+        const isDataFrame = img.getAttribute("data-frame") === "true";
+
+        if (isDataFrame) {
+          dataFrame++;
+        }
+
+        if (hrefLower.startsWith("data:image/svg+xml")) {
+          embeddedSvg++;
+        } else if (hrefLower.startsWith("data:image/")) {
+          embeddedRaster++;
+        } else if (href) {
+          external++;
+        }
+      }
+
+      return {
+        indexVersion: IMPORTER_VERSION,
+
+        total: imageNodes.length,
+        embeddedRaster,
+        embeddedSvg,
+        external,
+        dataFrame,
+
+        externalProxyFetched: 0,
+        externalProxyFetchFailed: 0,
+
+        externalMatched: 0,
+        externalMatchedBySlot: 0,
+        externalMatchedByName: 0,
+        externalMatchedByResourceId: 0,
+        externalMatchedByUniqueUrlOrder: 0,
+        externalMatchedByOrder: 0,
+        externalOrderMatchDisabled: true,
+        externalReusedByUniqueUrl: 0,
+        externalUnmatched: 0,
+
+        uniqueExternalUrlCount: 0,
+        externalSlotFilesProvided: 0,
+
+        externalRefs: [],
+        externalProxyFetchedRefs: [],
+        externalProxyFetchFailedRefs: [],
+        externalUnmatchedRefs: [],
+
+        safe5ClipPathCropEnabled: true,
+        directClipPathImagesFound: 0,
+        directClipPathImagesCropped: 0,
+        directClipPathCropFailed: 0,
+
+        structureDiagnostics,
+
+        externalAssignments: []
+      };
+    }
+
+    function addExternalAssignment(imageSummary, data) {
+      imageSummary.externalAssignments.push({
+        imageElementIndex: data.imageElementIndex,
+        method: data.method,
+        uniqueExternalIndex: data.uniqueExternalIndex,
+        svgHref: data.svgHref || "",
+        selectedFileName: data.selectedFileName || "",
+        selectedFileSize: data.selectedFileSize || 0,
+        selectedFileType: data.selectedFileType || "",
+        x: data.x || "0",
+        y: data.y || "0",
+        width: data.width || "0",
+        height: data.height || "0",
+        proxyError: data.proxyError || "",
+        clipApplied: !!data.clipApplied,
+        clipPathId: data.clipPathId || "",
+        clipError: data.clipError || ""
+      });
+    }
+
+    function findUniqueExternalImages(doc) {
+      const imageNodes = Array.from(doc.querySelectorAll("image"));
+      const map = new Map();
+
+      for (let i = 0; i < imageNodes.length; i++) {
+        const img = imageNodes[i];
+        const href = getHref(img);
+
+        if (!isExternalImageHref(href)) continue;
+
+        const key = normalizePathToken(href);
+        const resourceId = extractMiroResourceId(href);
+
+        if (!map.has(key)) {
+          map.set(key, {
+            key,
+            href,
+            resourceId,
+            indexes: [],
+            count: 0,
+            firstBox: {
+              x: img.getAttribute("x") || "0",
+              y: img.getAttribute("y") || "0",
+              width: img.getAttribute("width") || "0",
+              height: img.getAttribute("height") || "0"
+            }
+          });
+        }
+
+        const info = map.get(key);
+        info.indexes.push(i);
+        info.count++;
+      }
+
+      return Array.from(map.values());
+    }
+
+    function renderExternalPanel(infos) {
+      scannedExternalInfos = infos;
+      externalList.innerHTML = "";
+
+      if (!infos.length) {
+        externalPanel.style.display = "none";
+        return;
+      }
+
+      externalPanel.style.display = "block";
+
+      for (let i = 0; i < infos.length; i++) {
+        const info = infos[i];
+
+        const card = document.createElement("div");
+        card.className = "external-card";
+
+        const title = document.createElement("div");
+        title.className = "external-title";
+        title.textContent = "External image URL #" + (i + 1);
+        card.appendChild(title);
+
+        const meta = document.createElement("div");
+        meta.className = "external-meta";
+
+        let metaText =
+          "Used in SVG placements: " + info.count +
+          " | Image element indexes: " + info.indexes.join(", ") +
+          " | First SVG box: " +
+          info.firstBox.width + " x " + info.firstBox.height +
+          " at x=" + info.firstBox.x + ", y=" + info.firstBox.y;
+
+        if (info.resourceId) {
+          metaText += " | Resource ID filename: " + info.resourceId + ".png";
+        }
+
+        meta.textContent = metaText;
+        card.appendChild(meta);
+
+        const urlDiv = document.createElement("div");
+        urlDiv.className = "external-url";
+        urlDiv.textContent = info.href;
+        card.appendChild(urlDiv);
+
+        const link = document.createElement("a");
+        link.href = info.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "Open this image URL in browser";
+        card.appendChild(link);
+
+        const fileLabel = document.createElement("label");
+        fileLabel.textContent = "Choose replacement image for URL #" + (i + 1);
+        card.appendChild(fileLabel);
+
+        const fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.accept = "image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg";
+        fileInput.setAttribute("data-external-url-key", info.key);
+        card.appendChild(fileInput);
+
+        externalList.appendChild(card);
+      }
+    }
+
+    async function scanSelectedSvgForExternalImages() {
+      try {
+        const file = fileInput.files[0];
+
+        if (!file) {
+          externalPanel.style.display = "none";
+          externalList.innerHTML = "";
+          scannedExternalInfos = [];
+          log.textContent = "Waiting for SVG...";
+          return;
+        }
+
+        log.textContent = "Scanning SVG for external image URLs...";
+
+        const svg = await file.text();
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(svg, "image/svg+xml");
+
+        const parserError = doc.querySelector("parsererror");
+        if (parserError) {
+          throw new Error("SVG parse error while scanning.");
+        }
+
+        const infos = findUniqueExternalImages(doc);
+        renderExternalPanel(infos);
+
+        log.textContent =
+          "Scan complete.\n" +
+          "Version: " + IMPORTER_VERSION + "\n" +
+          "Unique external image URLs found: " + infos.length + "\n\n" +
+          "Use the matching URL slot for protected images, or batch files named by resource ID like 3074457346247371882.png.";
+      } catch (err) {
+        log.textContent = "Scan Error: " + (err && err.message ? err.message : String(err));
+      }
+    }
+
+    function findBatchMatchForExternalHref(originalHref, assetData) {
+      const exactKey = normalizePathToken(originalHref);
+      const baseKey = getBaseName(originalHref);
+      const resourceId = extractMiroResourceId(originalHref);
+
+      if (assetData.map.has(exactKey)) {
+        return {
+          asset: assetData.map.get(exactKey),
+          method: "manual filename/path batch match"
+        };
+      }
+
+      if (assetData.map.has(baseKey)) {
+        return {
+          asset: assetData.map.get(baseKey),
+          method: "manual filename/path batch match"
+        };
+      }
+
+      if (resourceId && assetData.map.has(resourceId)) {
+        return {
+          asset: assetData.map.get(resourceId),
+          method: "manual Miro resource-ID filename match"
+        };
+      }
+
+      return null;
+    }
+
+    async function extractImages(doc, assetData, slotAssetMap, imageSummary, classRules) {
+      const images = Array.from(doc.querySelectorAll("image"));
+      const items = [];
+
+      const uniqueUrlToAsset = new Map();
+      const uniqueUrlToIndex = new Map();
+      let nextUniqueExternalIndex = 0;
+
+      imageSummary.externalSlotFilesProvided = slotAssetMap.size;
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const originalHref = getHref(img);
+        const hrefLower = originalHref.toLowerCase();
+
+        let href = originalHref;
+        let selectedFileName = "";
+        let selectedFileSize = 0;
+        let selectedFileType = "";
+        let assignmentMethod = "embedded raster";
+        let proxyErrorForAssignment = "";
+        let uniqueExternalIndexForAssignment = "";
+
+        const imageX = img.getAttribute("x") || "0";
+        const imageY = img.getAttribute("y") || "0";
+        const imageWidth = img.getAttribute("width") || "0";
+        const imageHeight = img.getAttribute("height") || "0";
+
+        if (hrefLower.startsWith("data:image/") && !hrefLower.startsWith("data:image/svg+xml")) {
+          // Embedded raster image. Keep href as-is.
+        }
+
+        else if (hrefLower.startsWith("data:image/svg+xml")) {
+          // Embedded SVG image. Still skip as raster for now.
+          continue;
+        }
+
+        else if (isExternalImageHref(originalHref)) {
+          imageSummary.externalRefs.push(originalHref);
+
+          const normalizedExternalUrl = normalizePathToken(originalHref);
+
+          let uniqueExternalIndex;
+
+          if (uniqueUrlToIndex.has(normalizedExternalUrl)) {
+            uniqueExternalIndex = uniqueUrlToIndex.get(normalizedExternalUrl);
+          } else {
+            uniqueExternalIndex = nextUniqueExternalIndex;
+            uniqueUrlToIndex.set(normalizedExternalUrl, uniqueExternalIndex);
+            nextUniqueExternalIndex++;
+          }
+
+          uniqueExternalIndexForAssignment = uniqueExternalIndex + 1;
+
+          log.textContent =
+            "Trying local proxy fetch for external image...\n\n" +
+            "SVG image element index: " + i + "\n" +
+            "Unique external URL #: " + (uniqueExternalIndex + 1) + "\n" +
+            "URL: " + originalHref + "\n\n" +
+            "safe5: loading image, then applying direct clip-path crop if needed.";
+
+          const proxyResult = await fetchExternalImageThroughProxy(originalHref);
+
+          if (proxyResult.ok && proxyResult.dataUrl) {
+            imageSummary.externalProxyFetched++;
+            imageSummary.externalProxyFetchedRefs.push(originalHref);
+            href = proxyResult.dataUrl;
+
+            const fetchedAsset = {
+              name: "proxy-fetched unique URL #" + (uniqueExternalIndex + 1),
+              size: 0,
+              type: "image/proxy",
+              dataUrl: proxyResult.dataUrl
+            };
+
+            uniqueUrlToAsset.set(normalizedExternalUrl, fetchedAsset);
+            assignmentMethod = "local proxy fetch";
+          } else {
+            imageSummary.externalProxyFetchFailed++;
+            imageSummary.externalProxyFetchFailedRefs.push(originalHref);
+            proxyErrorForAssignment = proxyResult.error;
+
+            let matchedAsset = null;
+
+            if (uniqueUrlToAsset.has(normalizedExternalUrl)) {
+              matchedAsset = uniqueUrlToAsset.get(normalizedExternalUrl);
+
+              imageSummary.externalMatched++;
+              imageSummary.externalReusedByUniqueUrl++;
+              href = matchedAsset.dataUrl;
+
+              assignmentMethod = "reuse previous unique URL file";
+            } else if (slotAssetMap.has(normalizedExternalUrl)) {
+              matchedAsset = slotAssetMap.get(normalizedExternalUrl);
+
+              imageSummary.externalMatched++;
+              imageSummary.externalMatchedBySlot++;
+              href = matchedAsset.dataUrl;
+
+              uniqueUrlToAsset.set(normalizedExternalUrl, matchedAsset);
+              assignmentMethod = "guided per-URL replacement slot";
+            } else {
+              const batchMatch = findBatchMatchForExternalHref(originalHref, assetData);
+
+              if (batchMatch && batchMatch.asset) {
+                matchedAsset = batchMatch.asset;
+
+                imageSummary.externalMatched++;
+
+                if (batchMatch.method === "manual Miro resource-ID filename match") {
+                  imageSummary.externalMatchedByResourceId++;
+                } else {
+                  imageSummary.externalMatchedByName++;
+                }
+
+                href = matchedAsset.dataUrl;
+
+                uniqueUrlToAsset.set(normalizedExternalUrl, matchedAsset);
+                assignmentMethod = batchMatch.method;
+              } else {
+                imageSummary.externalUnmatched++;
+                imageSummary.externalUnmatchedRefs.push(originalHref);
+
+                addExternalAssignment(imageSummary, {
+                  imageElementIndex: i,
+                  method: "unmatched - no proxy, no guided slot, no exact filename/resource-ID match",
+                  uniqueExternalIndex: uniqueExternalIndex + 1,
+                  svgHref: originalHref,
+                  x: imageX,
+                  y: imageY,
+                  width: imageWidth,
+                  height: imageHeight,
+                  proxyError: proxyResult.error
+                });
+
+                continue;
+              }
+            }
+
+            if (matchedAsset) {
+              selectedFileName = matchedAsset.name;
+              selectedFileSize = matchedAsset.size;
+              selectedFileType = matchedAsset.type;
+            }
+          }
+        }
+
+        else {
+          continue;
+        }
+
+        const placed = await applyDirectClipPathCropIfNeeded(
+          doc,
+          classRules,
+          img,
+          href,
+          imageSummary
+        );
+
+        addExternalAssignment(imageSummary, {
+          imageElementIndex: i,
+          method: assignmentMethod,
+          uniqueExternalIndex: uniqueExternalIndexForAssignment,
+          svgHref: originalHref,
+          selectedFileName,
+          selectedFileSize,
+          selectedFileType,
+          x: imageX,
+          y: imageY,
+          width: imageWidth,
+          height: imageHeight,
+          proxyError: proxyErrorForAssignment,
+          clipApplied: placed.clipApplied,
+          clipPathId: placed.clipPathId,
+          clipError: placed.clipError
+        });
+
+        items.push({
+          index: i,
+          name: "Miro image " + i,
+          href: placed.href,
+          originalHref,
+          x: placed.x,
+          y: placed.y,
+          width: placed.width,
+          height: placed.height,
+          preserveAspectRatio: img.getAttribute("preserveAspectRatio") || "",
+          transform: placed.transform,
+          dataFrame: img.getAttribute("data-frame") || "",
+          clipApplied: placed.clipApplied,
+          clipPathId: placed.clipPathId
+        });
+      }
+
+      imageSummary.uniqueExternalUrlCount = nextUniqueExternalIndex;
+
+      return items;
+    }
+
+    function extractTexts(doc, classRules) {
+      const textNodes = Array.from(doc.querySelectorAll("text"));
+      const items = [];
+
+      for (let i = 0; i < textNodes.length; i++) {
+        const textNode = textNodes[i];
+
+        const value = (textNode.textContent || "").trim();
+        if (!value) continue;
+
+        items.push({
+          index: i,
+          name: "Miro text " + i,
+          text: value,
+          x: textNode.getAttribute("x") || "0",
+          y: textNode.getAttribute("y") || "0",
+          fill: getInheritedSvgProp(textNode, classRules, "fill", "#000000"),
+          fontSize: getInheritedSvgProp(textNode, classRules, "font-size", "16"),
+          fontFamily: getInheritedSvgProp(textNode, classRules, "font-family", "Arial"),
+          fontWeight: getInheritedSvgProp(textNode, classRules, "font-weight", "400"),
+          textLength: textNode.getAttribute("textLength") || "",
+          transform: getTransformChain(textNode)
+        });
+      }
+
+      return items;
+    }
+
+    function buildVectorOverlaySvg(svgText) {
+      const parser = new DOMParser();
+      const overlayDoc = parser.parseFromString(svgText, "image/svg+xml");
+
+      const parserError = overlayDoc.querySelector("parsererror");
+      if (parserError) {
+        throw new Error("SVG parse error while building vector overlay.");
+      }
+
+      Array.from(overlayDoc.querySelectorAll("image")).forEach(node => {
+        node.remove();
+      });
+
+      Array.from(overlayDoc.querySelectorAll("text")).forEach(node => {
+        node.remove();
+      });
+
+      Array.from(overlayDoc.querySelectorAll("title,desc")).forEach(node => {
+        node.remove();
+      });
+
+      const serializer = new XMLSerializer();
+      const overlaySvg = serializer.serializeToString(overlayDoc);
+
+      const bounds = measureSvgBounds(overlaySvg);
+
+      return {
+        svg: overlaySvg,
+        bounds
+      };
+    }
+
+    function measureSvgBounds(svgText) {
+      const holder = document.createElement("div");
+
+      holder.style.position = "absolute";
+      holder.style.left = "-100000px";
+      holder.style.top = "-100000px";
+      holder.style.width = "1px";
+      holder.style.height = "1px";
+      holder.style.overflow = "hidden";
+      holder.style.opacity = "0";
+      holder.style.pointerEvents = "none";
+
+      holder.innerHTML = svgText;
+      document.body.appendChild(holder);
+
+      let bounds = {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0
+      };
+
+      try {
+        const svg = holder.querySelector("svg");
+
+        if (svg && svg.getBBox) {
+          const box = svg.getBBox();
+
+          bounds = {
+            x: box.x,
+            y: box.y,
+            width: box.width,
+            height: box.height
+          };
+        }
+      } catch (err) {
+        bounds = {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0
+        };
+      }
+
+      holder.remove();
+      return bounds;
+    }
+
+    function countVectorNodesFromOverlay(overlaySvg) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(overlaySvg, "image/svg+xml");
+
+      return doc.querySelectorAll(
+        "rect,path,line,polyline,polygon,ellipse,circle,use,g"
+      ).length;
+    }
+
+    fileInput.addEventListener("change", () => {
+      scanSelectedSvgForExternalImages();
+    });
+
+    document.getElementById("import").onclick = async () => {
+      try {
+        const file = fileInput.files[0];
+
+        if (!file) {
+          log.textContent = "Choose an SVG first.";
+          return;
+        }
+
+        const assetFiles = Array.from(assetInput.files || []);
+
+        log.textContent =
+          "Reading files...\n" +
+          "Version: " + IMPORTER_VERSION + "\n" +
+          "SVG: " + file.name + "\n" +
+          "Guided external image slots visible: " + scannedExternalInfos.length + "\n" +
+          "Manual backup batch files selected: " + assetFiles.length;
+
+        const svg = await file.text();
+        const assetData = await buildAssetData(assetFiles);
+        const slotAssetMap = await buildSlotAssetData();
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(svg, "image/svg+xml");
+
+        const parserError = doc.querySelector("parsererror");
+        if (parserError) {
+          throw new Error("SVG parse error.");
+        }
+
+        const classRules = parseCssRules(doc);
+        const structureDiagnostics = collectImageStructureDiagnostics(doc, classRules);
+        const imageSummary = summarizeImages(doc, structureDiagnostics);
+
+        const images = await extractImages(doc, assetData, slotAssetMap, imageSummary, classRules);
+        const texts = extractTexts(doc, classRules);
+
+        const vectorOverlay = buildVectorOverlaySvg(svg);
+        const vectorOverlaySvg = vectorOverlay.svg;
+        const vectorOverlayBounds = vectorOverlay.bounds;
+        const vectorNodeCount = countVectorNodesFromOverlay(vectorOverlaySvg);
+
+        log.textContent =
+          "Loaded: " + file.name + "\n" +
+          "Version: " + IMPORTER_VERSION + "\n" +
+          "SVG size: " + Math.round(svg.length / 1024) + " KB\n\n" +
+
+          "Image summary:\n" +
+          "All <image> elements: " + imageSummary.total + "\n" +
+          "Embedded raster image elements: " + imageSummary.embeddedRaster + "\n" +
+          "Embedded SVG image elements: " + imageSummary.embeddedSvg + "\n" +
+          "External/linked image refs: " + imageSummary.external + "\n" +
+          "Unique external URLs: " + imageSummary.uniqueExternalUrlCount + "\n" +
+          "Guided slot files provided: " + imageSummary.externalSlotFilesProvided + "\n" +
+          "External images proxy-fetched: " + imageSummary.externalProxyFetched + "\n" +
+          "External proxy fetch failed: " + imageSummary.externalProxyFetchFailed + "\n" +
+          "External image refs manually matched: " + imageSummary.externalMatched + "\n" +
+          "Matched by guided slot: " + imageSummary.externalMatchedBySlot + "\n" +
+          "Matched by filename/path: " + imageSummary.externalMatchedByName + "\n" +
+          "Matched by Miro resource ID: " + imageSummary.externalMatchedByResourceId + "\n" +
+          "Matched by batch order: " + imageSummary.externalMatchedByOrder + "\n" +
+          "Batch-order matching disabled: " + imageSummary.externalOrderMatchDisabled + "\n" +
+          "External image refs unmatched: " + imageSummary.externalUnmatched + "\n" +
+          "data-frame image elements: " + imageSummary.dataFrame + "\n" +
+          "Raster images sent to Penpot: " + images.length + "\n\n" +
+
+          "safe5 clip-path crop:\n" +
+          "safe5 clip-path crop enabled: " + imageSummary.safe5ClipPathCropEnabled + "\n" +
+          "direct clip-path images found: " + imageSummary.directClipPathImagesFound + "\n" +
+          "direct clip-path images cropped: " + imageSummary.directClipPathImagesCropped + "\n" +
+          "direct clip-path crop failed: " + imageSummary.directClipPathCropFailed + "\n\n" +
+
+          "Structure summary:\n" +
+          "clipPath elements: " + structureDiagnostics.clipPathNodes + "\n" +
+          "mask elements: " + structureDiagnostics.maskNodes + "\n" +
+          "use elements: " + structureDiagnostics.useNodes + "\n" +
+          "images with direct clip-path: " + structureDiagnostics.imagesWithDirectClipPath + "\n" +
+          "embedded SVG image objects: " + structureDiagnostics.embeddedSvgImageObjects + "\n\n" +
+
+          "Vector/text summary:\n" +
+          "Vector overlay nodes: " + vectorNodeCount + "\n" +
+          "Overlay bounds x/y: " + Math.round(vectorOverlayBounds.x) + ", " + Math.round(vectorOverlayBounds.y) + "\n" +
+          "Editable text objects: " + texts.length + "\n\n" +
+
+          "Sending data to Penpot...";
+
+        parent.postMessage({
+          type: "import-content",
+          name: file.name,
+          imageSummary,
+          images,
+          vectorOverlaySvg,
+          vectorOverlayBounds,
+          vectorNodeCount,
+          texts
+        }, "*");
+
+      } catch (err) {
+        log.textContent = "UI Error: " + (err && err.message ? err.message : String(err));
+      }
+    };
+
+    window.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type === "status") {
+        log.textContent = data.message;
+      }
+    });
+  </script>
+
+  <!-- Local Miro SVG Importer index.html version: v0.9.2-safe5 -->
+</body>
+</html>
