@@ -269,7 +269,9 @@ External image refs unmatched
 
 Some protected Miro images may not be retrievable automatically. In those cases, the importer can use manually selected image files when available.
 
-                                                                                          Port 8123 is not reachable
+
+
+Port 8123 is not reachable
 
 If the server is running on another computer, verify that:
 
