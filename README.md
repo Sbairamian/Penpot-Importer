@@ -162,11 +162,13 @@ Vector graphics
 Text
 Image clipping information
 
-After selecting the file, select:
+10. After selecting the file, select:
 
 Import SVG Images + Vector Overlay + Text
 
 The plugin will then create the supported elements inside the current Penpot document.
+
+
 
 External Images
 
@@ -232,9 +234,10 @@ The plugin files will no longer be available to Penpot until the server is start
 node cors-server.js
 
 
-                                                                                                      Troubleshooting
 
-                                                                                                Manifest.json does not load
+Troubleshooting
+
+Manifest.json does not load
 
 Make sure the importer server is running:
 
