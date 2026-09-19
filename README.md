@@ -170,7 +170,7 @@ The plugin will then create the supported elements inside the current Penpot doc
 
 
 
-External Images
+EXTERNAL IMAGES
 
 Some Miro SVG exports reference images hosted externally instead of embedding the images directly inside the SVG.
 
@@ -235,9 +235,9 @@ node cors-server.js
 
 
 
-Troubleshooting
+TROUBLESHOOTING
 
-Manifest.json does not load
+ISSUE: Manifest.json does not load
 
 Make sure the importer server is running:
 
@@ -271,7 +271,7 @@ Some protected Miro images may not be retrievable automatically. In those cases,
 
 
 
-Port 8123 is not reachable
+ISSUE: Port 8123 is not reachable
 
 If the server is running on another computer, verify that:
 
